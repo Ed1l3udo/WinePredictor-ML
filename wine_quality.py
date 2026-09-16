@@ -401,6 +401,237 @@ class KNNScratch:
     def predict_classification(self, X: np.ndarray) -> np.ndarray:
         return np.argmax(self.predict_proba(X), axis=1)
 
+@dataclass
+class RegressionTreeNode:
+    """One node in a manually built regression tree."""
+
+    value: float
+    feature_index: int | None = None
+    threshold: float | None = None
+    left: "RegressionTreeNode | None" = None
+    right: "RegressionTreeNode | None" = None
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.feature_index is None
+
+
+class DecisionTreeRegressorScratch:
+    """CART-style regression tree used as the base learner for Random Forest."""
+
+    def __init__(
+        self,
+        max_depth: int | None,
+        min_samples_split: int,
+        min_samples_leaf: int,
+        max_features: str | int,
+        n_split_candidates: int,
+        random_state: int,
+    ) -> None:
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.max_features = max_features
+        self.n_split_candidates = n_split_candidates
+        self.rng = np.random.default_rng(random_state)
+        self.root: RegressionTreeNode | None = None
+        self.feature_importances_: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "DecisionTreeRegressorScratch":
+        self.feature_importances_ = np.zeros(X.shape[1], dtype=float)
+        self.root = self._build_tree(X, y, depth=0)
+        total_importance = self.feature_importances_.sum()
+        if total_importance > 0:
+            self.feature_importances_ /= total_importance
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if self.root is None:
+            raise RuntimeError("DecisionTreeRegressorScratch must be fit before predict.")
+        return np.array([self._predict_one(row, self.root) for row in X], dtype=float)
+
+    def _predict_one(self, row: np.ndarray, node: RegressionTreeNode) -> float:
+        while not node.is_leaf:
+            assert node.feature_index is not None
+            assert node.threshold is not None
+            if row[node.feature_index] <= node.threshold:
+                assert node.left is not None
+                node = node.left
+            else:
+                assert node.right is not None
+                node = node.right
+        return node.value
+
+    def _build_tree(self, X: np.ndarray, y: np.ndarray, depth: int) -> RegressionTreeNode:
+        node_value = float(np.mean(y))
+        node = RegressionTreeNode(value=node_value)
+
+        if self._should_stop(y, depth):
+            return node
+
+        split = self._best_split(X, y)
+        if split is None:
+            return node
+
+        feature_index, threshold, impurity_decrease = split
+        left_mask = X[:, feature_index] <= threshold
+        right_mask = ~left_mask
+
+        if left_mask.sum() < self.min_samples_leaf or right_mask.sum() < self.min_samples_leaf:
+            return node
+
+        if self.feature_importances_ is not None:
+            self.feature_importances_[feature_index] += impurity_decrease
+
+        node.feature_index = feature_index
+        node.threshold = threshold
+        node.left = self._build_tree(X[left_mask], y[left_mask], depth + 1)
+        node.right = self._build_tree(X[right_mask], y[right_mask], depth + 1)
+        return node
+
+    def _should_stop(self, y: np.ndarray, depth: int) -> bool:
+        if len(y) < self.min_samples_split:
+            return True
+        if self.max_depth is not None and depth >= self.max_depth:
+            return True
+        return float(np.var(y)) <= 1e-12
+
+    def _feature_subset(self, n_features: int) -> np.ndarray:
+        if self.max_features == "sqrt":
+            size = max(1, int(np.sqrt(n_features)))
+        elif self.max_features == "all":
+            size = n_features
+        elif isinstance(self.max_features, int):
+            size = min(n_features, self.max_features)
+        else:
+            size = n_features
+        return self.rng.choice(n_features, size=size, replace=False)
+
+    def _best_split(self, X: np.ndarray, y: np.ndarray) -> tuple[int, float, float] | None:
+        n_samples, n_features = X.shape
+        if n_samples < 2 * self.min_samples_leaf:
+            return None
+
+        parent_sse = self._sse(y)
+        best_feature: int | None = None
+        best_threshold: float | None = None
+        best_sse = parent_sse
+
+        for feature_index in self._feature_subset(n_features):
+            column = X[:, feature_index]
+            order = np.argsort(column)
+            x_sorted = column[order]
+            y_sorted = y[order]
+
+            if x_sorted[0] == x_sorted[-1]:
+                continue
+
+            candidate_count = min(self.n_split_candidates, n_samples - 2 * self.min_samples_leaf)
+            split_positions = np.linspace(
+                self.min_samples_leaf,
+                n_samples - self.min_samples_leaf,
+                num=candidate_count,
+                dtype=int,
+            )
+            split_positions = np.unique(split_positions)
+
+            cumulative_y = np.cumsum(y_sorted)
+            cumulative_y2 = np.cumsum(y_sorted**2)
+            total_y = cumulative_y[-1]
+            total_y2 = cumulative_y2[-1]
+
+            for position in split_positions:
+                if x_sorted[position - 1] == x_sorted[position]:
+                    continue
+
+                left_count = position
+                right_count = n_samples - position
+                left_sum = cumulative_y[position - 1]
+                left_sum2 = cumulative_y2[position - 1]
+                right_sum = total_y - left_sum
+                right_sum2 = total_y2 - left_sum2
+
+                left_sse = left_sum2 - (left_sum * left_sum / left_count)
+                right_sse = right_sum2 - (right_sum * right_sum / right_count)
+                total_sse = left_sse + right_sse
+
+                if total_sse < best_sse:
+                    best_sse = total_sse
+                    best_feature = int(feature_index)
+                    best_threshold = float((x_sorted[position - 1] + x_sorted[position]) / 2.0)
+
+        if best_feature is None or best_threshold is None:
+            return None
+
+        impurity_decrease = float(parent_sse - best_sse)
+        if impurity_decrease <= 1e-12:
+            return None
+        return best_feature, best_threshold, impurity_decrease
+
+    @staticmethod
+    def _sse(y: np.ndarray) -> float:
+        return float(np.sum((y - np.mean(y)) ** 2))
+
+
+class RandomForestRegressorScratch:
+    """Random Forest regressor built from scratch with bootstrap aggregation."""
+
+    def __init__(
+        self,
+        n_estimators: int,
+        max_depth: int | None,
+        min_samples_split: int,
+        min_samples_leaf: int,
+        max_features: str | int = "sqrt",
+        n_split_candidates: int = 32,
+        bootstrap_fraction: float = 1.0,
+        random_state: int = RANDOM_STATE,
+    ) -> None:
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.max_features = max_features
+        self.n_split_candidates = n_split_candidates
+        self.bootstrap_fraction = bootstrap_fraction
+        self.random_state = random_state
+        self.trees: list[DecisionTreeRegressorScratch] = []
+        self.feature_importances_: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "RandomForestRegressorScratch":
+        rng = np.random.default_rng(self.random_state)
+        n_samples = len(y)
+        bootstrap_size = max(1, int(round(n_samples * self.bootstrap_fraction)))
+        self.trees = []
+        importances = np.zeros(X.shape[1], dtype=float)
+
+        for _ in range(self.n_estimators):
+            sample_idx = rng.integers(0, n_samples, size=bootstrap_size)
+            tree_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+            tree = DecisionTreeRegressorScratch(
+                max_depth=self.max_depth,
+                min_samples_split=self.min_samples_split,
+                min_samples_leaf=self.min_samples_leaf,
+                max_features=self.max_features,
+                n_split_candidates=self.n_split_candidates,
+                random_state=tree_seed,
+            )
+            tree.fit(X[sample_idx], y[sample_idx])
+            self.trees.append(tree)
+            if tree.feature_importances_ is not None:
+                importances += tree.feature_importances_
+
+        total_importance = importances.sum()
+        self.feature_importances_ = importances / total_importance if total_importance > 0 else importances
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if not self.trees:
+            raise RuntimeError("RandomForestRegressorScratch must be fit before predict.")
+        predictions = np.vstack([tree.predict(X) for tree in self.trees])
+        return predictions.mean(axis=0)
+
+
 def kfold_indices(n_samples: int, n_folds: int, seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
     """Build shuffled K-fold train/validation indices."""
     rng = np.random.default_rng(seed)
@@ -548,6 +779,48 @@ def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, model_name: st
     save_current_plot(f"confusion_matrix_{safe_name(model_name)}.png")
 
 
+def tune_random_forest(X: np.ndarray, y: np.ndarray, cv_strata: np.ndarray) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Select a small Random Forest hyperparameter grid by CV RMSE."""
+    folds = stratified_kfold_indices(cv_strata, RF_TUNING_FOLDS, RANDOM_STATE)
+    rows: list[dict[str, Any]] = []
+
+    for config in RF_SEARCH_SPACE:
+        fold_scores = []
+        for fold_number, (train_idx, validation_idx) in enumerate(folds):
+            X_fold_train, X_fold_validation, _, _ = standardize_from_train(X[train_idx], X[validation_idx])
+            model = RandomForestRegressorScratch(
+                n_estimators=RF_TUNING_N_ESTIMATORS,
+                max_depth=int(config["max_depth"]),
+                min_samples_split=int(config["min_samples_split"]),
+                min_samples_leaf=int(config["min_samples_leaf"]),
+                max_features=str(config["max_features"]),
+                n_split_candidates=RF_N_SPLIT_CANDIDATES,
+                random_state=RANDOM_STATE + fold_number,
+            ).fit(X_fold_train, y[train_idx])
+            predictions = model.predict(X_fold_validation)
+            fold_scores.append(rmse(y[validation_idx], predictions))
+
+        rows.append(
+            {
+                "max_depth": int(config["max_depth"]),
+                "min_samples_split": int(config["min_samples_split"]),
+                "min_samples_leaf": int(config["min_samples_leaf"]),
+                "max_features": str(config["max_features"]),
+                "cv_rmse": float(np.mean(fold_scores)),
+            }
+        )
+
+    cv_results = pd.DataFrame(rows)
+    best_row = cv_results.sort_values("cv_rmse").iloc[0]
+    best_config = {
+        "max_depth": int(best_row["max_depth"]),
+        "min_samples_split": int(best_row["min_samples_split"]),
+        "min_samples_leaf": int(best_row["min_samples_leaf"]),
+        "max_features": str(best_row["max_features"]),
+    }
+    return best_config, cv_results
+
+
 def tune_logistic_l2(X: np.ndarray, y: np.ndarray, cv_strata: np.ndarray) -> tuple[float, pd.DataFrame]:
     """Select softmax L2 strength by stratified CV using macro AUC-ROC."""
     folds = stratified_kfold_indices(cv_strata, CV_FOLDS, RANDOM_STATE)
@@ -691,6 +964,18 @@ def classification_row(
         "tuning_seconds": tuning_seconds,
         **class_metrics,
     }
+
+def plot_random_forest_importance(importances: np.ndarray, feature_names: list[str]) -> None:
+    """Save feature importances learned by the manual Random Forest."""
+    importance_df = pd.DataFrame({"feature": feature_names, "importance": importances})
+    importance_df = importance_df.sort_values("importance", ascending=True)
+
+    plt.figure(figsize=(9, 6))
+    sns.barplot(data=importance_df, y="feature", x="importance", color="#2f6f73")
+    plt.title("Importancia de atributos - Random Forest")
+    plt.xlabel("Importancia")
+    plt.ylabel("Atributo")
+    save_current_plot("rf_feature_importance_regressor.png")
 
 def plot_softmax_coefficients(coefficients: np.ndarray, feature_names: list[str]) -> None:
     """Save standardized coefficients from the manual Softmax Regression."""
