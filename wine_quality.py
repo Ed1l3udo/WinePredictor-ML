@@ -276,3 +276,327 @@ def preprocess_data(df: pd.DataFrame, seed: int = RANDOM_STATE, verbose: bool = 
         "feature_names": feature_names,
     }
 
+class KNNScratch:
+    """K-nearest neighbors for regression or multiclass classification."""
+
+    def __init__(self, k: int, batch_size: int = 256) -> None:
+        self.k = k
+        self.batch_size = batch_size
+        self.X_train: np.ndarray | None = None
+        self.y_train: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "KNNScratch":
+        self.X_train = X
+        self.y_train = y
+        return self
+
+    def _nearest_values(self, X: np.ndarray) -> list[np.ndarray]:
+        if self.X_train is None or self.y_train is None:
+            raise RuntimeError("KNNScratch must be fit before prediction.")
+
+        train_squared = np.sum(self.X_train**2, axis=1)
+        nearest_batches: list[np.ndarray] = []
+
+        for start in range(0, len(X), self.batch_size):
+            batch = X[start : start + self.batch_size]
+            distances = (
+                np.sum(batch**2, axis=1)[:, None]
+                + train_squared[None, :]
+                - 2.0 * batch @ self.X_train.T
+            )
+            distances = np.maximum(distances, 0.0)
+            nearest_idx = np.argpartition(distances, kth=self.k - 1, axis=1)[:, : self.k]
+            nearest_batches.append(self.y_train[nearest_idx])
+
+        return nearest_batches
+
+    def predict_regression(self, X: np.ndarray) -> np.ndarray:
+        predictions = [values.mean(axis=1) for values in self._nearest_values(X)]
+        return np.concatenate(predictions)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        probability_batches = []
+        for values in self._nearest_values(X):
+            batch_probabilities = np.zeros((values.shape[0], N_CLASSES), dtype=float)
+            for row_index, neighbor_labels in enumerate(values.astype(int)):
+                counts = np.bincount(neighbor_labels, minlength=N_CLASSES)
+                batch_probabilities[row_index] = counts / self.k
+            probability_batches.append(batch_probabilities)
+        return np.vstack(probability_batches)
+
+    def predict_classification(self, X: np.ndarray) -> np.ndarray:
+        return np.argmax(self.predict_proba(X), axis=1)
+
+def kfold_indices(n_samples: int, n_folds: int, seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build shuffled K-fold train/validation indices."""
+    rng = np.random.default_rng(seed)
+    indices = np.arange(n_samples)
+    rng.shuffle(indices)
+    folds = np.array_split(indices, n_folds)
+    output: list[tuple[np.ndarray, np.ndarray]] = []
+
+    for fold_number in range(n_folds):
+        validation_idx = folds[fold_number]
+        train_idx = np.concatenate([folds[i] for i in range(n_folds) if i != fold_number])
+        output.append((train_idx, validation_idx))
+    return output
+
+
+def stratified_kfold_indices(y: np.ndarray, n_folds: int, seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Build stratified K-fold train/validation indices for class labels."""
+    rng = np.random.default_rng(seed)
+    fold_lists: list[list[int]] = [[] for _ in range(n_folds)]
+
+    for label in np.unique(y):
+        label_indices = np.flatnonzero(y == label)
+        rng.shuffle(label_indices)
+        for fold_number, split in enumerate(np.array_split(label_indices, n_folds)):
+            fold_lists[fold_number].extend(split.tolist())
+
+    output: list[tuple[np.ndarray, np.ndarray]] = []
+    all_indices = np.arange(len(y))
+    for fold in fold_lists:
+        validation_idx = np.array(fold, dtype=int)
+        validation_mask = np.zeros(len(y), dtype=bool)
+        validation_mask[validation_idx] = True
+        train_idx = all_indices[~validation_mask]
+        rng.shuffle(train_idx)
+        rng.shuffle(validation_idx)
+        output.append((train_idx, validation_idx))
+    return output
+
+
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def r2_score_manual(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    residual_sum = np.sum((y_true - y_pred) ** 2)
+    total_sum = np.sum((y_true - np.mean(y_true)) ** 2)
+    if total_sum == 0:
+        return float("nan")
+    return float(1.0 - residual_sum / total_sum)
+
+
+def confusion_matrix_manual(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    matrix = np.zeros((N_CLASSES, N_CLASSES), dtype=int)
+    for true_value, predicted_value in zip(y_true.astype(int), y_pred.astype(int), strict=True):
+        matrix[true_value, predicted_value] += 1
+    return matrix
+
+
+def auc_roc_manual(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Compute binary ROC-AUC with average ranks for tied scores."""
+    y_true = y_true.astype(int)
+    n_positive = int(np.sum(y_true == 1))
+    n_negative = int(np.sum(y_true == 0))
+    if n_positive == 0 or n_negative == 0:
+        return float("nan")
+
+    order = np.argsort(y_score)
+    sorted_scores = y_score[order]
+    ranks = np.empty(len(y_score), dtype=float)
+
+    start = 0
+    while start < len(sorted_scores):
+        end = start + 1
+        while end < len(sorted_scores) and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        average_rank = (start + 1 + end) / 2.0
+        ranks[order[start:end]] = average_rank
+        start = end
+
+    positive_rank_sum = ranks[y_true == 1].sum()
+    auc = (positive_rank_sum - n_positive * (n_positive + 1) / 2.0) / (n_positive * n_negative)
+    return float(auc)
+
+
+def multiclass_auc_roc_ovr(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Compute macro one-vs-rest AUC-ROC for multiclass predictions."""
+    auc_values = []
+    for label in range(N_CLASSES):
+        binary_true = (y_true.astype(int) == label).astype(int)
+        auc_values.append(auc_roc_manual(binary_true, y_score[:, label]))
+    return float(np.nanmean(auc_values))
+
+
+def classification_scores(y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
+    """Compute multiclass classification metrics from scratch."""
+    matrix = confusion_matrix_manual(y_true, y_pred)
+    per_class_precision: list[float] = []
+    per_class_recall: list[float] = []
+    per_class_f1: list[float] = []
+
+    for label in range(N_CLASSES):
+        true_positive = matrix[label, label]
+        predicted_positive = matrix[:, label].sum()
+        actual_positive = matrix[label, :].sum()
+        precision = true_positive / predicted_positive if predicted_positive else 0.0
+        recall = true_positive / actual_positive if actual_positive else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        per_class_precision.append(float(precision))
+        per_class_recall.append(float(recall))
+        per_class_f1.append(float(f1))
+
+    return {
+        "accuracy": float(np.mean(y_true == y_pred)),
+        "f1_macro": float(np.mean(per_class_f1)),
+        "auc_roc_macro": multiclass_auc_roc_ovr(y_true, y_score),
+        "precision_ruim": per_class_precision[0],
+        "recall_ruim": per_class_recall[0],
+        "precision_mediano": per_class_precision[1],
+        "recall_mediano": per_class_recall[1],
+        "precision_bom": per_class_precision[2],
+        "recall_bom": per_class_recall[2],
+    }
+
+
+def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, model_name: str) -> None:
+    """Save a confusion matrix for a classifier or binned regressor."""
+    matrix = confusion_matrix_manual(y_true, y_pred)
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(
+        matrix,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        cbar=False,
+        xticklabels=CLASS_LABELS,
+        yticklabels=CLASS_LABELS,
+    )
+    plt.title(f"Matriz de confusao - {model_name}")
+    plt.xlabel("Classe predita")
+    plt.ylabel("Classe real")
+    save_current_plot(f"confusion_matrix_{safe_name(model_name)}.png")
+
+
+def tune_knn_k(X: np.ndarray, y: np.ndarray, task: str, cv_strata: np.ndarray) -> tuple[int, pd.DataFrame]:
+    """Select KNN k by manual CV for regression RMSE or classification macro AUC."""
+    folds = stratified_kfold_indices(cv_strata, CV_FOLDS, RANDOM_STATE)
+
+    rows: list[dict[str, float]] = []
+    for k in K_VALUES:
+        fold_scores = []
+        for train_idx, validation_idx in folds:
+            X_fold_train, X_fold_validation, _, _ = standardize_from_train(X[train_idx], X[validation_idx])
+            model = KNNScratch(k=k).fit(X_fold_train, y[train_idx])
+            if task == "regression":
+                predictions = model.predict_regression(X_fold_validation)
+                fold_scores.append(rmse(y[validation_idx], predictions))
+            else:
+                probabilities = model.predict_proba(X_fold_validation)
+                fold_scores.append(multiclass_auc_roc_ovr(y[validation_idx].astype(int), probabilities))
+
+        metric_name = "cv_rmse" if task == "regression" else "cv_auc_roc_macro"
+        rows.append({"k": float(k), metric_name: float(np.mean(fold_scores))})
+
+    cv_results = pd.DataFrame(rows)
+    if task == "regression":
+        best_k = int(cv_results.sort_values("cv_rmse").iloc[0]["k"])
+    else:
+        best_k = int(cv_results.sort_values("cv_auc_roc_macro", ascending=False).iloc[0]["k"])
+    return best_k, cv_results
+
+
+def regression_row(
+    model_name: str,
+    y_true_reg: np.ndarray,
+    y_pred_reg: np.ndarray,
+    y_true_cls: np.ndarray,
+    *,
+    y_train_reg: np.ndarray | None = None,
+    y_train_pred_reg: np.ndarray | None = None,
+    y_train_cls: np.ndarray | None = None,
+    fit_seconds: float = float("nan"),
+    predict_seconds: float = float("nan"),
+    tuning_seconds: float = float("nan"),
+    plot: bool = True,
+) -> dict[str, float | str]:
+    """Compute regression metrics plus three-class binned classification metrics."""
+    y_pred_cls = quality_to_class(y_pred_reg)
+    class_scores = quality_scores_to_class_scores(y_pred_reg)
+    class_metrics = classification_scores(y_true_cls, y_pred_cls, class_scores)
+    if plot:
+        plot_confusion_matrix(y_true_cls, y_pred_cls, f"{model_name} class binned")
+
+    train_rmse = float("nan")
+    train_accuracy = float("nan")
+    train_f1_macro = float("nan")
+    train_auc_roc_macro = float("nan")
+    if y_train_reg is not None and y_train_pred_reg is not None and y_train_cls is not None:
+        train_rmse = rmse(y_train_reg, y_train_pred_reg)
+        train_pred_cls = quality_to_class(y_train_pred_reg)
+        train_scores = quality_scores_to_class_scores(y_train_pred_reg)
+        train_class_metrics = classification_scores(y_train_cls, train_pred_cls, train_scores)
+        train_accuracy = train_class_metrics["accuracy"]
+        train_f1_macro = train_class_metrics["f1_macro"]
+        train_auc_roc_macro = train_class_metrics["auc_roc_macro"]
+
+    return {
+        "model": model_name,
+        "formulation": "regression",
+        "prediction_type": "raw_quality_then_3_class_bins",
+        "train_rmse": train_rmse,
+        "train_accuracy": train_accuracy,
+        "train_f1_macro": train_f1_macro,
+        "train_auc_roc_macro": train_auc_roc_macro,
+        "rmse": rmse(y_true_reg, y_pred_reg),
+        "mae": mae(y_true_reg, y_pred_reg),
+        "r2": r2_score_manual(y_true_reg, y_pred_reg),
+        "fit_seconds": fit_seconds,
+        "predict_seconds": predict_seconds,
+        "tuning_seconds": tuning_seconds,
+        **class_metrics,
+    }
+
+
+def classification_row(
+    model_name: str,
+    y_true_cls: np.ndarray,
+    y_pred_cls: np.ndarray,
+    y_score: np.ndarray,
+    *,
+    y_train_cls: np.ndarray | None = None,
+    y_train_pred_cls: np.ndarray | None = None,
+    y_train_score: np.ndarray | None = None,
+    fit_seconds: float = float("nan"),
+    predict_seconds: float = float("nan"),
+    tuning_seconds: float = float("nan"),
+    plot: bool = True,
+) -> dict[str, float | str]:
+    """Compute three-class classification metrics."""
+    class_metrics = classification_scores(y_true_cls, y_pred_cls, y_score)
+    if plot:
+        plot_confusion_matrix(y_true_cls, y_pred_cls, model_name)
+
+    train_accuracy = float("nan")
+    train_f1_macro = float("nan")
+    train_auc_roc_macro = float("nan")
+    if y_train_cls is not None and y_train_pred_cls is not None and y_train_score is not None:
+        train_class_metrics = classification_scores(y_train_cls, y_train_pred_cls, y_train_score)
+        train_accuracy = train_class_metrics["accuracy"]
+        train_f1_macro = train_class_metrics["f1_macro"]
+        train_auc_roc_macro = train_class_metrics["auc_roc_macro"]
+
+    return {
+        "model": model_name,
+        "formulation": "classification",
+        "prediction_type": "three_class",
+        "train_rmse": np.nan,
+        "train_accuracy": train_accuracy,
+        "train_f1_macro": train_f1_macro,
+        "train_auc_roc_macro": train_auc_roc_macro,
+        "rmse": np.nan,
+        "mae": np.nan,
+        "r2": np.nan,
+        "fit_seconds": fit_seconds,
+        "predict_seconds": predict_seconds,
+        "tuning_seconds": tuning_seconds,
+        **class_metrics,
+    }
+
+
