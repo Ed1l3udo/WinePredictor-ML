@@ -276,6 +276,80 @@ def preprocess_data(df: pd.DataFrame, seed: int = RANDOM_STATE, verbose: bool = 
         "feature_names": feature_names,
     }
 
+def add_intercept(X: np.ndarray) -> np.ndarray:
+    """Append a bias column to a feature matrix."""
+    return np.column_stack([np.ones(X.shape[0]), X])
+
+
+def softmax(logits: np.ndarray) -> np.ndarray:
+    """Numerically stable row-wise softmax."""
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    exp_values = np.exp(shifted)
+    return exp_values / exp_values.sum(axis=1, keepdims=True)
+
+
+def balanced_sample_weights(y: np.ndarray) -> np.ndarray:
+    """Return inverse-frequency weights for a classification target."""
+    weights = np.ones_like(y, dtype=float)
+    n_samples = len(y)
+    for label in np.unique(y):
+        count = np.sum(y == label)
+        weights[y == label] = n_samples / (len(np.unique(y)) * count)
+    return weights
+
+
+class SoftmaxRegressionScratch:
+    """Multiclass logistic regression trained by gradient descent."""
+
+    def __init__(
+        self,
+        l2_strength: float,
+        learning_rate: float = 0.08,
+        max_iter: int = 4000,
+        tolerance: float = 1e-8,
+    ) -> None:
+        self.l2_strength = l2_strength
+        self.learning_rate = learning_rate
+        self.max_iter = max_iter
+        self.tolerance = tolerance
+        self.weights: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "SoftmaxRegressionScratch":
+        X_bias = add_intercept(X)
+        weights = np.zeros((X_bias.shape[1], N_CLASSES), dtype=float)
+        y_one_hot = np.eye(N_CLASSES)[y.astype(int)]
+        sample_weights = balanced_sample_weights(y)
+        total_weight = sample_weights.sum()
+
+        for _ in range(self.max_iter):
+            probabilities = softmax(X_bias @ weights)
+            errors = (probabilities - y_one_hot) * sample_weights[:, None]
+            gradient = (X_bias.T @ errors) / total_weight
+            regularization = self.l2_strength * weights
+            regularization[0, :] = 0.0
+            update = self.learning_rate * (gradient + regularization)
+            weights -= update
+            if np.linalg.norm(update) < self.tolerance:
+                break
+
+        self.weights = weights
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.weights is None:
+            raise RuntimeError("SoftmaxRegressionScratch must be fit before predict_proba.")
+        return softmax(add_intercept(X) @ self.weights)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return np.argmax(self.predict_proba(X), axis=1)
+
+    @property
+    def coefficients(self) -> np.ndarray:
+        if self.weights is None:
+            raise RuntimeError("SoftmaxRegressionScratch must be fit before coefficients.")
+        return self.weights[1:]
+
+
 class KNNScratch:
     """K-nearest neighbors for regression or multiclass classification."""
 
@@ -474,6 +548,25 @@ def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, model_name: st
     save_current_plot(f"confusion_matrix_{safe_name(model_name)}.png")
 
 
+def tune_logistic_l2(X: np.ndarray, y: np.ndarray, cv_strata: np.ndarray) -> tuple[float, pd.DataFrame]:
+    """Select softmax L2 strength by stratified CV using macro AUC-ROC."""
+    folds = stratified_kfold_indices(cv_strata, CV_FOLDS, RANDOM_STATE)
+    rows: list[dict[str, float]] = []
+
+    for strength in LOGISTIC_L2_STRENGTHS:
+        fold_scores = []
+        for train_idx, validation_idx in folds:
+            X_fold_train, X_fold_validation, _, _ = standardize_from_train(X[train_idx], X[validation_idx])
+            model = SoftmaxRegressionScratch(l2_strength=float(strength)).fit(X_fold_train, y[train_idx])
+            probabilities = model.predict_proba(X_fold_validation)
+            fold_scores.append(multiclass_auc_roc_ovr(y[validation_idx], probabilities))
+        rows.append({"l2_strength": float(strength), "cv_auc_roc_macro": float(np.mean(fold_scores))})
+
+    cv_results = pd.DataFrame(rows)
+    best_strength = float(cv_results.sort_values("cv_auc_roc_macro", ascending=False).iloc[0]["l2_strength"])
+    return best_strength, cv_results
+
+
 def tune_knn_k(X: np.ndarray, y: np.ndarray, task: str, cv_strata: np.ndarray) -> tuple[int, pd.DataFrame]:
     """Select KNN k by manual CV for regression RMSE or classification macro AUC."""
     folds = stratified_kfold_indices(cv_strata, CV_FOLDS, RANDOM_STATE)
@@ -599,4 +692,25 @@ def classification_row(
         **class_metrics,
     }
 
+def plot_softmax_coefficients(coefficients: np.ndarray, feature_names: list[str]) -> None:
+    """Save standardized coefficients from the manual Softmax Regression."""
+    rows = []
+    for class_index, class_label in enumerate(CLASS_LABELS):
+        for feature_name, coefficient in zip(feature_names, coefficients[:, class_index], strict=True):
+            rows.append({"class": class_label, "feature": feature_name, "coefficient": coefficient})
+    coef_df = pd.DataFrame(rows)
+    feature_order = (
+        coef_df.groupby("feature")["coefficient"]
+        .apply(lambda values: values.abs().max())
+        .sort_values(ascending=True)
+        .index
+    )
 
+    plt.figure(figsize=(10, 7))
+    sns.barplot(data=coef_df, y="feature", x="coefficient", hue="class", order=feature_order, palette="Set2")
+    plt.axvline(0, color="black", linewidth=0.9)
+    plt.title("Coeficientes da Regressao Softmax")
+    plt.xlabel("Coeficiente")
+    plt.ylabel("Atributo")
+    plt.legend(title="Classe")
+    save_current_plot("softmax_coefficients.png")
