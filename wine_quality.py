@@ -276,6 +276,7 @@ def preprocess_data(df: pd.DataFrame, seed: int = RANDOM_STATE, verbose: bool = 
         "feature_names": feature_names,
     }
 
+
 def add_intercept(X: np.ndarray) -> np.ndarray:
     """Append a bias column to a feature matrix."""
     return np.column_stack([np.ones(X.shape[0]), X])
@@ -400,6 +401,7 @@ class KNNScratch:
 
     def predict_classification(self, X: np.ndarray) -> np.ndarray:
         return np.argmax(self.predict_proba(X), axis=1)
+
 
 @dataclass
 class RegressionTreeNode:
@@ -965,6 +967,517 @@ def classification_row(
         **class_metrics,
     }
 
+
+def train_and_evaluate(data: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, Any]]:
+    """Train selected models and return a consolidated results table."""
+    print("\n" + "=" * 80)
+    print("3. Selected Models")
+    print("=" * 80)
+    print("Chosen models:")
+    print("- Random Forest: stronger non-linear regressor for the raw quality score.")
+    print("- Softmax Regression: direct three-class classifier.")
+    print("- KNN: simple non-linear local model usable for both regression and three-class classification.")
+
+    X_train_raw = data["X_train_raw"]
+    X_train = data["X_train"]
+    X_test = data["X_test"]
+    y_reg_train = data["y_reg_train"]
+    y_reg_test = data["y_reg_test"]
+    y_cls_train = data["y_cls_train"]
+    y_cls_test = data["y_cls_test"]
+    cv_strata_train = data["cv_strata_train"]
+    seed = int(data["seed"])
+
+    assert isinstance(X_train_raw, np.ndarray)
+    assert isinstance(X_train, np.ndarray)
+    assert isinstance(X_test, np.ndarray)
+    assert isinstance(y_reg_train, np.ndarray)
+    assert isinstance(y_reg_test, np.ndarray)
+    assert isinstance(y_cls_train, np.ndarray)
+    assert isinstance(y_cls_test, np.ndarray)
+    assert isinstance(cv_strata_train, np.ndarray)
+
+    results: list[dict[str, float | str]] = []
+    artifacts: dict[str, np.ndarray] = {}
+    selected_params: dict[str, Any] = {}
+
+    mean_quality = float(np.mean(y_reg_train))
+    baseline_reg_train = np.full(len(y_reg_train), mean_quality, dtype=float)
+    baseline_reg_test = np.full(len(y_reg_test), mean_quality, dtype=float)
+    results.append(
+        regression_row(
+            "Baseline Mean Regressor",
+            y_reg_test,
+            baseline_reg_test,
+            y_cls_test,
+            y_train_reg=y_reg_train,
+            y_train_pred_reg=baseline_reg_train,
+            y_train_cls=y_cls_train,
+            fit_seconds=0.0,
+            predict_seconds=0.0,
+            tuning_seconds=0.0,
+            plot=False,
+        )
+    )
+
+    class_counts = np.bincount(y_cls_train.astype(int), minlength=N_CLASSES)
+    majority_class = int(np.argmax(class_counts))
+    class_priors = class_counts / class_counts.sum()
+    baseline_cls_train = np.full(len(y_cls_train), majority_class, dtype=int)
+    baseline_cls_test = np.full(len(y_cls_test), majority_class, dtype=int)
+    baseline_score_train = np.tile(class_priors, (len(y_cls_train), 1))
+    baseline_score_test = np.tile(class_priors, (len(y_cls_test), 1))
+    results.append(
+        classification_row(
+            "Baseline Majority Classifier",
+            y_cls_test,
+            baseline_cls_test,
+            baseline_score_test,
+            y_train_cls=y_cls_train,
+            y_train_pred_cls=baseline_cls_train,
+            y_train_score=baseline_score_train,
+            fit_seconds=0.0,
+            predict_seconds=0.0,
+            tuning_seconds=0.0,
+            plot=False,
+        )
+    )
+
+    print("\n" + "=" * 80)
+    print("4A. Regression")
+    print("=" * 80)
+
+    start = perf_counter()
+    best_rf_config, rf_cv = tune_random_forest(X_train_raw, y_reg_train, cv_strata_train)
+    rf_tuning_seconds = perf_counter() - start
+    selected_params["random_forest"] = best_rf_config
+    print("\nRandom Forest Regressor CV results:")
+    print(rf_cv.to_string(index=False, float_format=lambda value: f"{value:.5f}"))
+    print("Selected Random Forest settings:")
+    print(f"n_estimators={RF_N_ESTIMATORS}")
+    print(f"max_depth={best_rf_config['max_depth']}")
+    print(f"min_samples_split={best_rf_config['min_samples_split']}")
+    print(f"min_samples_leaf={best_rf_config['min_samples_leaf']}")
+    print(f"max_features={best_rf_config['max_features']}")
+    start = perf_counter()
+    random_forest = RandomForestRegressorScratch(
+        n_estimators=RF_N_ESTIMATORS,
+        max_depth=best_rf_config["max_depth"],
+        min_samples_split=best_rf_config["min_samples_split"],
+        min_samples_leaf=best_rf_config["min_samples_leaf"],
+        max_features=best_rf_config["max_features"],
+        n_split_candidates=RF_N_SPLIT_CANDIDATES,
+        random_state=seed,
+    ).fit(X_train, y_reg_train)
+    rf_fit_seconds = perf_counter() - start
+    start = perf_counter()
+    forest_predictions = random_forest.predict(X_test)
+    rf_predict_seconds = perf_counter() - start
+    forest_train_predictions = random_forest.predict(X_train)
+    results.append(
+        regression_row(
+            "Random Forest Regressor",
+            y_reg_test,
+            forest_predictions,
+            y_cls_test,
+            y_train_reg=y_reg_train,
+            y_train_pred_reg=forest_train_predictions,
+            y_train_cls=y_cls_train,
+            fit_seconds=rf_fit_seconds,
+            predict_seconds=rf_predict_seconds,
+            tuning_seconds=rf_tuning_seconds,
+        )
+    )
+    if random_forest.feature_importances_ is not None:
+        artifacts["random_forest_feature_importances"] = random_forest.feature_importances_
+
+    start = perf_counter()
+    best_k_reg, knn_reg_cv = tune_knn_k(X_train_raw, y_reg_train, task="regression", cv_strata=cv_strata_train)
+    knn_reg_tuning_seconds = perf_counter() - start
+    selected_params["knn_reg_k"] = best_k_reg
+    print("\nKNN Regressor CV results:")
+    print(knn_reg_cv.to_string(index=False, float_format=lambda value: f"{value:.5f}"))
+    print(f"Selected KNN regressor k: {best_k_reg}")
+    start = perf_counter()
+    knn_reg = KNNScratch(k=best_k_reg).fit(X_train, y_reg_train)
+    knn_reg_fit_seconds = perf_counter() - start
+    start = perf_counter()
+    knn_reg_predictions = knn_reg.predict_regression(X_test)
+    knn_reg_predict_seconds = perf_counter() - start
+    knn_reg_train_predictions = knn_reg.predict_regression(X_train)
+    results.append(
+        regression_row(
+            "KNN Regressor",
+            y_reg_test,
+            knn_reg_predictions,
+            y_cls_test,
+            y_train_reg=y_reg_train,
+            y_train_pred_reg=knn_reg_train_predictions,
+            y_train_cls=y_cls_train,
+            fit_seconds=knn_reg_fit_seconds,
+            predict_seconds=knn_reg_predict_seconds,
+            tuning_seconds=knn_reg_tuning_seconds,
+        )
+    )
+
+    print("\n" + "=" * 80)
+    print("4B. Three-Class Classification")
+    print("=" * 80)
+
+    start = perf_counter()
+    best_l2, logistic_cv = tune_logistic_l2(X_train_raw, y_cls_train, cv_strata_train)
+    softmax_tuning_seconds = perf_counter() - start
+    selected_params["softmax_l2_strength"] = best_l2
+    print("\nSoftmax Regression CV results:")
+    print(logistic_cv.to_string(index=False, float_format=lambda value: f"{value:.5f}"))
+    print(f"Selected Softmax l2_strength: {best_l2:.5f}")
+    start = perf_counter()
+    softmax_model = SoftmaxRegressionScratch(l2_strength=best_l2).fit(X_train, y_cls_train)
+    softmax_fit_seconds = perf_counter() - start
+    start = perf_counter()
+    softmax_probabilities = softmax_model.predict_proba(X_test)
+    softmax_predictions = np.argmax(softmax_probabilities, axis=1)
+    softmax_predict_seconds = perf_counter() - start
+    softmax_train_probabilities = softmax_model.predict_proba(X_train)
+    softmax_train_predictions = np.argmax(softmax_train_probabilities, axis=1)
+    results.append(
+        classification_row(
+            "Softmax Regression",
+            y_cls_test,
+            softmax_predictions,
+            softmax_probabilities,
+            y_train_cls=y_cls_train,
+            y_train_pred_cls=softmax_train_predictions,
+            y_train_score=softmax_train_probabilities,
+            fit_seconds=softmax_fit_seconds,
+            predict_seconds=softmax_predict_seconds,
+            tuning_seconds=softmax_tuning_seconds,
+        )
+    )
+    artifacts["softmax_coefficients"] = softmax_model.coefficients
+
+    start = perf_counter()
+    best_k_cls, knn_cls_cv = tune_knn_k(X_train_raw, y_cls_train, task="classification", cv_strata=cv_strata_train)
+    knn_cls_tuning_seconds = perf_counter() - start
+    selected_params["knn_cls_k"] = best_k_cls
+    print("\nKNN Classifier CV results:")
+    print(knn_cls_cv.to_string(index=False, float_format=lambda value: f"{value:.5f}"))
+    print(f"Selected KNN classifier k: {best_k_cls}")
+    start = perf_counter()
+    knn_cls = KNNScratch(k=best_k_cls).fit(X_train, y_cls_train)
+    knn_cls_fit_seconds = perf_counter() - start
+    start = perf_counter()
+    knn_cls_probabilities = knn_cls.predict_proba(X_test)
+    knn_cls_predictions = np.argmax(knn_cls_probabilities, axis=1)
+    knn_cls_predict_seconds = perf_counter() - start
+    knn_cls_train_probabilities = knn_cls.predict_proba(X_train)
+    knn_cls_train_predictions = np.argmax(knn_cls_train_probabilities, axis=1)
+    results.append(
+        classification_row(
+            "KNN Classifier",
+            y_cls_test,
+            knn_cls_predictions,
+            knn_cls_probabilities,
+            y_train_cls=y_cls_train,
+            y_train_pred_cls=knn_cls_train_predictions,
+            y_train_score=knn_cls_train_probabilities,
+            fit_seconds=knn_cls_fit_seconds,
+            predict_seconds=knn_cls_predict_seconds,
+            tuning_seconds=knn_cls_tuning_seconds,
+        )
+    )
+
+    summary = build_results_summary(results)
+    return summary, artifacts, selected_params
+
+
+def fixed_model_rows(data: dict[str, Any], selected_params: dict[str, Any]) -> list[dict[str, float | str]]:
+    """Evaluate final models with previously selected hyperparameters."""
+    X_train = data["X_train"]
+    X_test = data["X_test"]
+    y_reg_train = data["y_reg_train"]
+    y_reg_test = data["y_reg_test"]
+    y_cls_train = data["y_cls_train"]
+    y_cls_test = data["y_cls_test"]
+    seed = int(data["seed"])
+
+    assert isinstance(X_train, np.ndarray)
+    assert isinstance(X_test, np.ndarray)
+    assert isinstance(y_reg_train, np.ndarray)
+    assert isinstance(y_reg_test, np.ndarray)
+    assert isinstance(y_cls_train, np.ndarray)
+    assert isinstance(y_cls_test, np.ndarray)
+
+    rows: list[dict[str, float | str]] = []
+
+    mean_quality = float(np.mean(y_reg_train))
+    baseline_reg_train = np.full(len(y_reg_train), mean_quality, dtype=float)
+    baseline_reg_test = np.full(len(y_reg_test), mean_quality, dtype=float)
+    rows.append(
+        regression_row(
+            "Baseline Mean Regressor",
+            y_reg_test,
+            baseline_reg_test,
+            y_cls_test,
+            y_train_reg=y_reg_train,
+            y_train_pred_reg=baseline_reg_train,
+            y_train_cls=y_cls_train,
+            fit_seconds=0.0,
+            predict_seconds=0.0,
+            tuning_seconds=0.0,
+            plot=False,
+        )
+    )
+
+    class_counts = np.bincount(y_cls_train.astype(int), minlength=N_CLASSES)
+    majority_class = int(np.argmax(class_counts))
+    class_priors = class_counts / class_counts.sum()
+    baseline_cls_train = np.full(len(y_cls_train), majority_class, dtype=int)
+    baseline_cls_test = np.full(len(y_cls_test), majority_class, dtype=int)
+    baseline_score_train = np.tile(class_priors, (len(y_cls_train), 1))
+    baseline_score_test = np.tile(class_priors, (len(y_cls_test), 1))
+    rows.append(
+        classification_row(
+            "Baseline Majority Classifier",
+            y_cls_test,
+            baseline_cls_test,
+            baseline_score_test,
+            y_train_cls=y_cls_train,
+            y_train_pred_cls=baseline_cls_train,
+            y_train_score=baseline_score_train,
+            fit_seconds=0.0,
+            predict_seconds=0.0,
+            tuning_seconds=0.0,
+            plot=False,
+        )
+    )
+
+    rf_config = selected_params["random_forest"]
+    start = perf_counter()
+    random_forest = RandomForestRegressorScratch(
+        n_estimators=RF_N_ESTIMATORS,
+        max_depth=rf_config["max_depth"],
+        min_samples_split=rf_config["min_samples_split"],
+        min_samples_leaf=rf_config["min_samples_leaf"],
+        max_features=rf_config["max_features"],
+        n_split_candidates=RF_N_SPLIT_CANDIDATES,
+        random_state=seed,
+    ).fit(X_train, y_reg_train)
+    rf_fit_seconds = perf_counter() - start
+    start = perf_counter()
+    forest_predictions = random_forest.predict(X_test)
+    rf_predict_seconds = perf_counter() - start
+    forest_train_predictions = random_forest.predict(X_train)
+    rows.append(
+        regression_row(
+            "Random Forest Regressor",
+            y_reg_test,
+            forest_predictions,
+            y_cls_test,
+            y_train_reg=y_reg_train,
+            y_train_pred_reg=forest_train_predictions,
+            y_train_cls=y_cls_train,
+            fit_seconds=rf_fit_seconds,
+            predict_seconds=rf_predict_seconds,
+            tuning_seconds=0.0,
+            plot=False,
+        )
+    )
+
+    knn_reg = KNNScratch(k=int(selected_params["knn_reg_k"])).fit(X_train, y_reg_train)
+    start = perf_counter()
+    knn_reg_predictions = knn_reg.predict_regression(X_test)
+    knn_reg_predict_seconds = perf_counter() - start
+    knn_reg_train_predictions = knn_reg.predict_regression(X_train)
+    rows.append(
+        regression_row(
+            "KNN Regressor",
+            y_reg_test,
+            knn_reg_predictions,
+            y_cls_test,
+            y_train_reg=y_reg_train,
+            y_train_pred_reg=knn_reg_train_predictions,
+            y_train_cls=y_cls_train,
+            fit_seconds=0.0,
+            predict_seconds=knn_reg_predict_seconds,
+            tuning_seconds=0.0,
+            plot=False,
+        )
+    )
+
+    softmax_model = SoftmaxRegressionScratch(l2_strength=float(selected_params["softmax_l2_strength"])).fit(
+        X_train,
+        y_cls_train,
+    )
+    start = perf_counter()
+    softmax_probabilities = softmax_model.predict_proba(X_test)
+    softmax_predictions = np.argmax(softmax_probabilities, axis=1)
+    softmax_predict_seconds = perf_counter() - start
+    softmax_train_probabilities = softmax_model.predict_proba(X_train)
+    softmax_train_predictions = np.argmax(softmax_train_probabilities, axis=1)
+    rows.append(
+        classification_row(
+            "Softmax Regression",
+            y_cls_test,
+            softmax_predictions,
+            softmax_probabilities,
+            y_train_cls=y_cls_train,
+            y_train_pred_cls=softmax_train_predictions,
+            y_train_score=softmax_train_probabilities,
+            fit_seconds=0.0,
+            predict_seconds=softmax_predict_seconds,
+            tuning_seconds=0.0,
+            plot=False,
+        )
+    )
+
+    knn_cls = KNNScratch(k=int(selected_params["knn_cls_k"])).fit(X_train, y_cls_train)
+    start = perf_counter()
+    knn_cls_probabilities = knn_cls.predict_proba(X_test)
+    knn_cls_predictions = np.argmax(knn_cls_probabilities, axis=1)
+    knn_cls_predict_seconds = perf_counter() - start
+    knn_cls_train_probabilities = knn_cls.predict_proba(X_train)
+    knn_cls_train_predictions = np.argmax(knn_cls_train_probabilities, axis=1)
+    rows.append(
+        classification_row(
+            "KNN Classifier",
+            y_cls_test,
+            knn_cls_predictions,
+            knn_cls_probabilities,
+            y_train_cls=y_cls_train,
+            y_train_pred_cls=knn_cls_train_predictions,
+            y_train_score=knn_cls_train_probabilities,
+            fit_seconds=0.0,
+            predict_seconds=knn_cls_predict_seconds,
+            tuning_seconds=0.0,
+            plot=False,
+        )
+    )
+
+    return rows
+
+
+def summarize_repeated_splits(repeated_results: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate repeated split metrics with normal-approximation 95% CIs."""
+    metrics = ["rmse", "accuracy", "f1_macro", "auc_roc_macro"]
+    rows: list[dict[str, float | str | int]] = []
+
+    group_columns = ["model", "formulation", "prediction_type"]
+    for keys, group in repeated_results.groupby(group_columns, sort=False):
+        row: dict[str, float | str | int] = {
+            "model": keys[0],
+            "formulation": keys[1],
+            "prediction_type": keys[2],
+            "n_splits": int(group["seed"].nunique()),
+        }
+        for metric in metrics:
+            values = pd.to_numeric(group[metric], errors="coerce").dropna()
+            if values.empty:
+                row[f"{metric}_mean"] = np.nan
+                row[f"{metric}_ci95"] = np.nan
+                continue
+            row[f"{metric}_mean"] = float(values.mean())
+            row[f"{metric}_ci95"] = float(CI_Z_VALUE * values.std(ddof=1) / np.sqrt(len(values))) if len(values) > 1 else 0.0
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def evaluate_repeated_splits(df: pd.DataFrame, selected_params: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the selected final models over multiple stratified splits."""
+    repeated_tables = []
+    for seed in REPEATED_SPLIT_SEEDS:
+        split_data = preprocess_data(df, seed=seed, verbose=False)
+        split_summary = build_results_summary(fixed_model_rows(split_data, selected_params))
+        split_summary.insert(0, "seed", seed)
+        repeated_tables.append(split_summary)
+
+    repeated_results = pd.concat(repeated_tables, axis=0, ignore_index=True)
+    repeated_summary = summarize_repeated_splits(repeated_results)
+    return repeated_results, repeated_summary
+
+
+def build_results_summary(rows: list[dict[str, float | str]]) -> pd.DataFrame:
+    """Build one consolidated DataFrame with formulation-aware sorting."""
+    columns = [
+        "model",
+        "formulation",
+        "prediction_type",
+        "train_rmse",
+        "train_accuracy",
+        "train_f1_macro",
+        "train_auc_roc_macro",
+        "rmse",
+        "mae",
+        "r2",
+        "fit_seconds",
+        "predict_seconds",
+        "tuning_seconds",
+        "accuracy",
+        "f1_macro",
+        "auc_roc_macro",
+        "precision_ruim",
+        "recall_ruim",
+        "precision_mediano",
+        "recall_mediano",
+        "precision_bom",
+        "recall_bom",
+    ]
+    summary = pd.DataFrame(rows, columns=columns)
+    formulation_order = {"regression": 0, "classification": 1}
+    summary["_formulation_order"] = summary["formulation"].map(formulation_order)
+    summary["_sort_metric"] = np.where(
+        summary["formulation"].eq("regression"),
+        summary["rmse"],
+        -summary["auc_roc_macro"],
+    )
+    summary = summary.sort_values(["_formulation_order", "_sort_metric", "model"]).drop(
+        columns=["_formulation_order", "_sort_metric"]
+    )
+    return summary.reset_index(drop=True)
+
+
+def plot_model_comparisons(summary: pd.DataFrame) -> None:
+    """Save comparison charts for regression and classification results."""
+    regression_summary = summary[summary["formulation"] == "regression"].copy()
+    if not regression_summary.empty:
+        plt.figure(figsize=(8, 5))
+        sns.barplot(data=regression_summary, x="model", y="rmse", color="#2f6f73")
+        plt.title("Comparacao de modelos de regressao - RMSE")
+        plt.xlabel("Modelo")
+        plt.ylabel("RMSE")
+        plt.xticks(rotation=15, ha="right")
+        save_current_plot("model_comparison_regression_rmse.png")
+
+    classification_summary = summary.copy()
+    classification_summary["label"] = np.where(
+        classification_summary["formulation"] == "regression",
+        classification_summary["model"] + " (classes)",
+        classification_summary["model"],
+    )
+    melted = classification_summary.melt(
+        id_vars=["label"],
+        value_vars=["accuracy", "f1_macro", "auc_roc_macro"],
+        var_name="metric",
+        value_name="score",
+    )
+    metric_names = {
+        "accuracy": "Acuracia",
+        "f1_macro": "F1 macro",
+        "auc_roc_macro": "AUC-ROC macro",
+    }
+    melted["metric"] = melted["metric"].map(metric_names)
+    plt.figure(figsize=(10, 5.5))
+    sns.barplot(data=melted, x="label", y="score", hue="metric")
+    plt.ylim(0, 1)
+    plt.title("Metricas de classificacao em tres classes")
+    plt.xlabel("Modelo")
+    plt.ylabel("Pontuacao")
+    plt.xticks(rotation=18, ha="right")
+    plt.legend(title="Metrica")
+    save_current_plot("model_comparison_classification_metrics.png")
+
+
 def plot_random_forest_importance(importances: np.ndarray, feature_names: list[str]) -> None:
     """Save feature importances learned by the manual Random Forest."""
     importance_df = pd.DataFrame({"feature": feature_names, "importance": importances})
@@ -976,6 +1489,7 @@ def plot_random_forest_importance(importances: np.ndarray, feature_names: list[s
     plt.xlabel("Importancia")
     plt.ylabel("Atributo")
     save_current_plot("rf_feature_importance_regressor.png")
+
 
 def plot_softmax_coefficients(coefficients: np.ndarray, feature_names: list[str]) -> None:
     """Save standardized coefficients from the manual Softmax Regression."""
@@ -999,3 +1513,52 @@ def plot_softmax_coefficients(coefficients: np.ndarray, feature_names: list[str]
     plt.ylabel("Atributo")
     plt.legend(title="Classe")
     save_current_plot("softmax_coefficients.png")
+
+
+def main() -> None:
+    """Run the full project pipeline."""
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 160)
+    sns.set_theme(style="whitegrid", context="notebook")
+    IMAGE_DIR.mkdir(exist_ok=True)
+
+    df = load_wine_data()
+    run_eda(df)
+    data = preprocess_data(df)
+    summary, artifacts, selected_params = train_and_evaluate(data)
+    repeated_results, repeated_summary = evaluate_repeated_splits(df, selected_params)
+
+    feature_names = data["feature_names"]
+    assert isinstance(feature_names, list)
+    plot_model_comparisons(summary)
+    if "random_forest_feature_importances" in artifacts:
+        plot_random_forest_importance(artifacts["random_forest_feature_importances"], feature_names)
+    if "softmax_coefficients" in artifacts:
+        plot_softmax_coefficients(artifacts["softmax_coefficients"], feature_names)
+
+    summary_path = BASE_DIR / "results_summary.csv"
+    repeated_results_path = BASE_DIR / "repeated_split_results.csv"
+    repeated_summary_path = BASE_DIR / "repeated_split_summary.csv"
+    summary.to_csv(summary_path, index=False)
+    repeated_results.to_csv(repeated_results_path, index=False)
+    repeated_summary.to_csv(repeated_summary_path, index=False)
+
+    print("\n" + "=" * 80)
+    print("5. Consolidated Results Summary")
+    print("=" * 80)
+    print(summary.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
+    print("\n" + "=" * 80)
+    print("6. Repeated Split Summary")
+    print("=" * 80)
+    print(repeated_summary.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
+    print("\nSaved PNG plots in:")
+    print(IMAGE_DIR)
+    print("\nSaved results table:")
+    print(summary_path)
+    print("\nSaved repeated split tables:")
+    print(repeated_results_path)
+    print(repeated_summary_path)
+
+
+if __name__ == "__main__":
+    main()
